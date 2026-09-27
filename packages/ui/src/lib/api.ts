@@ -1353,7 +1353,11 @@ export interface DelegationSettings {
     status: DelegationGmailStatus;
     message: string;
     email: string | null;
-    // How to connect your own Gmail (the token is minted locally).
+    // Which mailbox provider this is: "gmail" or "outlook", decided by
+    // which one the person connected. Field name kept as "gmail" — not
+    // provider-neutral — to match the backend's response shape.
+    provider: "gmail" | "outlook";
+    // How to connect your own mailbox (the token is minted locally).
     connect_command: string;
   };
 }

@@ -82,6 +82,7 @@ export default function ActAsMeCard() {
 
   const connected = settings.gmail.status === "connected";
   const on = settings.enabled;
+  const providerLabel = settings.gmail.provider === "outlook" ? "Outlook" : "Gmail";
 
   const toggle = async () => {
     setBusy(true);
@@ -107,23 +108,23 @@ export default function ActAsMeCard() {
       <h2 className="text-sm font-medium text-fg">Act as me</h2>
       <p className="mt-1 text-xs text-fg-muted leading-relaxed">
         Let the Executive write email as you, in your own voice. When you ask it to reply to or
-        write an email as you, it saves a draft in your own Gmail for you to review and send — it
+        write an email as you, it saves a draft in your own mailbox for you to review and send — it
         never sends anything. Everything else it writes stays in its own name.
       </p>
 
       <div className="mt-4 space-y-5 max-w-md">
-        {/* Your Gmail */}
+        {/* Your mailbox */}
         <div>
-          <div className="text-xs font-medium text-fg">Your Gmail</div>
+          <div className="text-xs font-medium text-fg">Your {providerLabel}</div>
           <p className="text-xs text-fg-muted mt-0.5 leading-relaxed">
             {connected ? `Connected to ${settings.gmail.email}.` : settings.gmail.message}
           </p>
           {!connected && settings.gmail.status === "not_configured" && (
             <div className="mt-2">
               <p className="text-xs text-fg-muted leading-relaxed">
-                On a computer with a browser, with the Executive&apos;s Google OAuth client exported, run
-                this and sign in as yourself, then put the file it writes where the API reads it
-                (see the Act as me section of .env.example):
+                On a computer with a browser, run this and sign in as yourself, then put the file
+                it writes where the API reads it (see docs/outlook_setup.md, or the Act as me
+                section of .env.example for Gmail):
               </p>
               <pre className="mt-1.5 whitespace-pre-wrap break-all rounded-md border border-line bg-surface px-2 py-1.5 text-[11px] text-fg">
                 {settings.gmail.connect_command}
@@ -151,10 +152,10 @@ export default function ActAsMeCard() {
               </div>
               <p className="text-xs text-fg-muted mt-0.5 leading-relaxed">
                 {on
-                  ? "On: ask it in chat — “reply to Dana as me: yes to the 5th” — and the draft waits in your Gmail Drafts."
+                  ? `On: ask it in chat — “reply to Dana as me: yes to the 5th” — and the draft waits in your ${providerLabel} Drafts.`
                   : connected
                     ? "Off: the Executive only ever writes as itself."
-                    : "Connect your Gmail first."}
+                    : `Connect your ${providerLabel} first.`}
               </p>
             </div>
             <button
@@ -179,14 +180,14 @@ export default function ActAsMeCard() {
           {error && <p className="mt-1 text-xs text-red-400">{error}</p>}
         </div>
 
-        <VoiceSection connected={connected} />
+        <VoiceSection connected={connected} providerLabel={providerLabel} />
       </div>
     </section>
   );
 }
 
 // "How I write": learned from your sent mail, editable, lockable.
-function VoiceSection({ connected }: { connected: boolean }) {
+function VoiceSection({ connected, providerLabel }: { connected: boolean; providerLabel: string }) {
   const [profile, setProfile] = useState<VoiceProfile | null>(null);
   const [greetings, setGreetings] = useState<Record<string, string>>({});
   const [habits, setHabits] = useState("");
@@ -257,14 +258,14 @@ function VoiceSection({ connected }: { connected: boolean }) {
     }
   };
 
-  const takeGmailSignature = () =>
+  const takeMailboxSignature = () =>
     void run(async () => {
       const next = await refreshVoiceSignature();
       if (!next.signature) {
         setNotice(
           profile.signature
-            ? "Your Gmail settings have no signature now, so none is added."
-            : "Your Gmail settings have no signature to add.",
+            ? `Your ${providerLabel} settings have no signature now, so none is added.`
+            : `Your ${providerLabel} settings have no signature to add.`,
         );
       }
       return next;
@@ -376,7 +377,7 @@ function VoiceSection({ connected }: { connected: boolean }) {
             {profile.signature ? (
               <>
                 <p className="mt-0.5 leading-relaxed">
-                  Added to the end of every draft, from your Gmail settings.
+                  Added to the end of every draft, from your {providerLabel} settings.
                 </p>
                 <div className="mt-1 whitespace-pre-wrap break-words border-l-2 border-line pl-2 leading-relaxed text-fg">
                   {profile.signature}
@@ -385,10 +386,10 @@ function VoiceSection({ connected }: { connected: boolean }) {
                   <button
                     type="button"
                     disabled={busy || !connected}
-                    onClick={takeGmailSignature}
+                    onClick={takeMailboxSignature}
                     className={linkButton}
                   >
-                    Refresh from Gmail
+                    Refresh from {providerLabel}
                   </button>
                   <button
                     type="button"
@@ -406,10 +407,10 @@ function VoiceSection({ connected }: { connected: boolean }) {
                 <button
                   type="button"
                   disabled={busy || !connected}
-                  onClick={takeGmailSignature}
+                  onClick={takeMailboxSignature}
                   className={`mt-1 ${linkButton}`}
                 >
-                  Add my Gmail signature
+                  Add my {providerLabel} signature
                 </button>
               </>
             )}

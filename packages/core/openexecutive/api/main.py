@@ -533,6 +533,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     initialize_user_scenarios_db()
 
     email_poller_task: asyncio.Task[None] | None = None
+    outlook_poller_task: asyncio.Task[None] | None = None
     scheduler_task: asyncio.Task[None] | None = None
     resumer_task: asyncio.Task[None] | None = None
     catalog_refresh_task: asyncio.Task[None] | None = None
@@ -561,6 +562,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.slack_handler = None
 
     email_poller_task = await _start_mcp_gateway(app, settings)
+
+    # Outlook has no MCP server the way Gmail's workspace-mcp is (see
+    # design.md decision 1), so its poller is a plain background task, gated
+    # only on Microsoft OAuth being fully configured — independent of
+    # whether the MCP gateway itself started.
+    if (
+        settings.microsoft_oauth_client_id
+        and settings.microsoft_oauth_client_secret
+        and settings.microsoft_oauth_tenant_id
+        and settings.exec_outlook_credentials_path
+    ):
+        from openexecutive.integrations.outlook_client import outlook_for
+        from openexecutive.integrations.outlook_poller import run_outlook_poller
+
+        outlook_poller_task = asyncio.create_task(
+            run_outlook_poller(outlook_for(settings.exec_email_address))
+        )
 
     if settings.scheduler_enabled:
         from openexecutive.scheduler import run_scheduler
@@ -748,6 +766,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         email_poller_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await email_poller_task
+
+    if outlook_poller_task is not None:
+        outlook_poller_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await outlook_poller_task
 
     if scheduler_task is not None:
         scheduler_task.cancel()

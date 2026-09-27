@@ -5224,15 +5224,22 @@ integrations:
     channel?).
 
     Inbound — divergent by channel today:
-      • Email: NO roster gate on inbound. Every non-automated message
-        flows to the Executive so triage can classify cold prospect
-        signal, escalate, log, or propose. When the sender isn't on
-        the People roster, the poller prepends a [POLICY] notice to
-        the body the Executive sees explaining that outbound reply
-        will be blocked. Audit ``integration_inbound`` row carries
-        ``details.outcome="accepted_non_roster"`` for observability —
-        the same row for one of the principal's contacts, who are private
-        to the principal (see ``people.kind``).
+      • Email (Gmail): NO roster gate on inbound. Every non-automated
+        message flows to the Executive so triage can classify cold
+        prospect signal, escalate, log, or propose. When the sender
+        isn't on the People roster, the poller prepends a [POLICY]
+        notice to the body the Executive sees explaining that outbound
+        reply will be blocked. Audit ``integration_inbound`` row
+        carries ``details.outcome="accepted_non_roster"`` for
+        observability — the same row for one of the principal's
+        contacts, who are private to the principal (see
+        ``people.kind``).
+      • Outlook: same policy as Gmail (no roster gate, the same
+        [POLICY] notice text, contact-private-session marking) — see
+        ``integrations.outlook_inbox``. A separate, parallel poller
+        (no MCP server exists for Outlook), audited under
+        ``actor="outlook"`` rather than Gmail's ``actor="email"`` so
+        the two channels' inbound history stays distinguishable.
       • Discord, Slack, Telegram: still roster-gated on inbound. A
         sender's channel ID must match a non-archived TEAM member's row
         (discord_user_id / slack_user_id / telegram_chat_id) — a
@@ -5268,6 +5275,15 @@ integrations:
         person-id recovery.
       • ``send_slack_dm`` does not have a roster check today — a
         pre-existing gap not addressed by the email-inbound change.
+      • Outlook send/reply/draft (``orchestrator.outlook_tools``): no
+        MCP server exists for Outlook, so there is no gateway call to
+        intercept the way ``_check_gmail_recipients`` does. Each native
+        tool calls a shared ``_check_recipients`` helper first — same
+        allow-list, same contact-egress rule, reusing
+        ``mcp_gateway._roster_allow_set()`` directly rather than a
+        second implementation — before any Graph call. A refusal writes
+        the same ``integration_outbound_blocked`` audit event type
+        Gmail's gate uses.
 
     The old env-var allowlists (EMAIL_ALLOWED_SENDERS /
     TELEGRAM_ALLOWED_CHAT_IDS / DISCORD_ALLOWED_USER_IDS) have been
@@ -5333,6 +5349,45 @@ integrations:
     inbound email (at least 5 model calls per message, ``medium`` Honcho
     prefetch) and removed because the revision pass never reaches
     Gmail anyway (outbound mail is sent from the draft's tool loop).
+  outlook_inbox: |
+    The Executive's own Outlook mailbox — the direct-Graph-client
+    analogue of ``email_poller`` above, for organizations without
+    Gmail. No MCP server exists for Outlook the way workspace-mcp is
+    for Gmail (the design's central decision), so this is two plain
+    pieces instead of one MCP-backed adapter:
+      • ``integrations.outlook_poller`` (inbound): polls
+        ``GET /me/mailFolders/inbox/messages?$filter=isRead eq false``
+        via ``integrations.outlook_client.OutlookClient`` and hands
+        each message straight to ``Executive.chat``. Same behavioral
+        contract as ``email_poller`` — no roster gate on inbound, the
+        same [POLICY] notice text for a non-roster sender, contact mail
+        and principal-forwards marked ``Session.private_to_principal``,
+        ``scheduler.pause`` respected. Redirect-steering headers
+        (Reply-To) need no explicit stripping: unlike Gmail's raw MIME
+        text, the turn text here is built field-by-field from Graph's
+        structured JSON, and ``reply_to`` is parsed but never included
+        in it. Quote-stripping / forwarded-message detection
+        (``email_poller._new_text_lines``, provider-agnostic string
+        logic) is reused as-is rather than reimplemented; Graph
+        messages carry an ``isDraft`` flag mapped onto a synthetic
+        ``MailMessage.labels = ["DRAFT"]`` so this reused logic (which
+        filters Gmail-labelled drafts) keeps working unmodified for
+        Outlook threads too (see ``delegation.outlook_client`` below).
+        Audited under ``actor="outlook"``, session id
+        ``outlook:{conversationId or sender}``.
+      • ``orchestrator.outlook_tools`` (outbound): three native tools —
+        ``send_outlook_email``, ``reply_outlook_email``,
+        ``draft_outlook_email`` — registered unconditionally in
+        ``executive._ALL_SKILL_TOOLS`` (a fixed, sorted, per-caching-
+        invariant list; Outlook being unconfigured is not a reason to
+        hide them — each handler checks configuration at call time and
+        returns a plain error instead of calling Graph). See
+        ``channel_access`` above for the roster-gate shape.
+    Started as a plain ``asyncio.create_task`` in the FastAPI lifespan,
+    independent of whether the MCP gateway itself started (unlike
+    Gmail's poller, which piggybacks on the gateway's startup) — gated
+    only on ``MICROSOFT_OAUTH_CLIENT_ID``/``_CLIENT_SECRET``/
+    ``_TENANT_ID`` and ``EXEC_OUTLOOK_CREDENTIALS_PATH`` all being set.
   slack: |
     openexecutive.integrations.slack_bot — async Bolt socket-mode
     adapter (``AsyncApp`` + ``AsyncSocketModeHandler``) embedded in the
@@ -5952,6 +6007,48 @@ integrations:
     send method. email_poller.sender_new_text (the poller's quoted-reply
     stripper, made public) keeps only each sender's own words for the voice
     learner and the ghostwriter's thread.
+
+  own_outlook: |
+    Act as me's Outlook counterpart to ``own_gmail`` above —
+    delegation.outlook.DelegateOutlook, read + draft only, same shape
+    (credential file per person, sha256(address) filename, 0600/0700,
+    minted by scripts/connect-own-outlook.py — a hand-rolled local-
+    redirect OAuth flow over stdlib http.server, no new dependency),
+    same re-verification (``outlook_status``, same status vocabulary as
+    ``gmail_status``: connected/not_configured/needs_reconnect/
+    mismatch/no_email/shared_mailbox/error) and the same "no send
+    method exists" invariant, enforced structurally: DelegateOutlook
+    subclasses ``integrations.outlook_client._GraphMailBase`` directly
+    — never ``OutlookClient`` (which legitimately has ``send()`` for
+    the Executive's own mailbox, ``integrations.outlook_inbox`` above)
+    — so there is no send method anywhere in its MRO. Credential
+    directory: DELEGATION_OUTLOOK_CREDENTIALS_DIR (company/
+    delegation_outlook/, /data/delegation_outlook in Docker) — separate
+    from EXEC_OUTLOOK_CREDENTIALS_PATH, the Executive's own mailbox
+    credential, the same separation ``own_gmail`` keeps from
+    WORKSPACE_MCP_CREDENTIALS_DIR.
+
+    ``delegation.mailbox.mailbox_for(email)`` resolves which provider
+    (Gmail or Outlook) backs a person's Act as me by which credential
+    file exists — not a stored column, to avoid a schema migration. A
+    person has at most one; if both somehow exist, Gmail wins (backward
+    compatibility) and a warning is logged.
+    ``orchestrator.delegation_tools.handle_ghostwrite_email`` dispatches
+    on ``isinstance(writer.mailbox, DelegateOutlook)`` at each point the
+    two providers' concrete types diverge: which ``DraftSpec``/
+    ``STATUS_MESSAGES``/exception classes to use, and — because Graph's
+    ``createReply`` needs the specific MESSAGE being replied to while
+    Gmail's ``threadId`` is the conversation itself —  a reply's
+    ``DraftSpec.thread_id`` is the last message's own id for Outlook,
+    not the thread id ``_plan_reply`` returns for Gmail. The JSON tool-
+    result key is still ``gmail_link`` for either provider (not renamed
+    provider-neutral) so no existing Gmail caller/test is affected. Both
+    providers structurally satisfy ``delegation.mailbox_protocol.
+    MailboxClient`` (profile_email/search_threads/get_thread/list_sent/
+    send_as_signature/create_draft) with no changes to either concrete
+    class — a mypy-checked ``TYPE_CHECKING`` assertion in that module
+    pins this. Graph has no signature API the way Gmail's
+    ``settings.sendAs`` is; ``send_as_signature()`` always returns "".
 
   mcp_server: |
     openexecutive.mcp_server — Open Executive exposed AS an MCP server, the
@@ -6820,6 +6917,32 @@ delegation:
     character reference past Unicode's range becomes U+FFFD before
     html.unescape (which raises past 4,300 digits). A unit test times
     crafted input.
+  outlook_client: |
+    integrations.outlook_client — direct Microsoft Graph REST (httpx),
+    shared by both Outlook tracks (own mailbox and Act as me): OAuth
+    token refresh (``login.microsoftonline.com/{tenant}/oauth2/v2.0/
+    token``), the HTTP wrapper (401 → GraphAuthError + evicts the
+    cached token, 403 → GraphAuthError, 429 → GraphError so it's
+    retried rather than treated as a reconnect, matching
+    ``gmail_client``'s 403-vs-429 distinction), and message parsing
+    against Graph's structured JSON (no marker-based text parsing the
+    way Gmail's MCP plain-text output needs). ``_GraphMailBase`` is the
+    read/draft surface both ``OutlookClient`` (own mailbox, adds
+    ``send``/``list_unread``/``mark_read``) and
+    ``delegation.outlook.DelegateOutlook`` (subclasses
+    ``_GraphMailBase`` directly, never ``OutlookClient``) build on — see
+    ``delegation.own_outlook``. Threading: ``create_draft`` uses Graph's
+    ``createReply`` when replying (which threads correctly and quotes
+    the original) rather than hand-building In-Reply-To/References the
+    way ``gmail_client`` does, because Graph only accepts custom
+    ``x-``-prefixed headers via ``internetMessageHeaders`` on a plain
+    create — the ghostwritten marker header still works
+    (``X-OE-Ghostwritten``); real reply threading a brand-new
+    (non-reply) message isn't attempted. ``CreatedDraft.web_link`` comes
+    straight from Graph's response on every create/update — no
+    Gmail-style link-builder needed. Scopes: ``Mail.ReadWrite`` +
+    ``offline_access`` for a delegated mailbox; adds ``Mail.Send`` for
+    the Executive's own.
   privacy: |
     From the moment ghostwrite_email sets touched_mail,
     people_tools.audit_row_private_to_principal answers True, so every row

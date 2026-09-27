@@ -36,6 +36,7 @@ from openexecutive.api.setup_checks import (
     check_gmail,
     check_google_chat,
     check_memory,
+    check_outlook,
     check_owner,
     check_scheduler,
     check_slack,
@@ -72,6 +73,10 @@ _ALL_OFF: dict[str, Any] = {
     "GOOGLE_CHAT_PROJECT_NUMBER": None,
     "GOOGLE_CHAT_SERVICE_ACCOUNT_FILE": None,
     "GOOGLE_CHAT_SERVICE_ACCOUNT_EMAIL": None,
+    "MICROSOFT_OAUTH_CLIENT_ID": None,
+    "MICROSOFT_OAUTH_CLIENT_SECRET": None,
+    "MICROSOFT_OAUTH_TENANT_ID": None,
+    "EXEC_OUTLOOK_CREDENTIALS_PATH": None,
     "MCP_ENABLED": False,
     "HONCHO_ENABLED": False,
     "SCHEDULER_ENABLED": True,
@@ -673,6 +678,77 @@ def test_gmail_problems(gmail_settings: Settings, monkeypatch: pytest.MonkeyPatc
     assert "GOOGLE_SERVICE_ACCOUNT_KEY_JSON" in check_gmail(make_snap(gmail_settings, mcp_gateway=object())).summary
     monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_KEY_FILE", "/keys/sa.json")
     assert check_gmail(make_snap(gmail_settings, mcp_gateway=object())).state == "ok"
+
+
+@pytest.fixture
+def outlook_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
+    # check_outlook reads snap.settings for the presence gate, but the
+    # underlying Graph calls (load_exec_credential, OutlookClient) read the
+    # process's live get_settings() — real env vars, not snap.settings,
+    # mirroring gmail_settings' GOOGLE_OAUTH_CLIENT_ID/_SECRET env vars below.
+    credentials_path = tmp_path / "exec_outlook.json"
+    monkeypatch.setenv("EXEC_EMAIL_ADDRESS", "exec@acme.io")
+    monkeypatch.setenv("MICROSOFT_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("MICROSOFT_OAUTH_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("MICROSOFT_OAUTH_TENANT_ID", "common")
+    monkeypatch.setenv("EXEC_OUTLOOK_CREDENTIALS_PATH", str(credentials_path))
+    return make_settings(
+        MICROSOFT_OAUTH_CLIENT_ID="cid",
+        MICROSOFT_OAUTH_CLIENT_SECRET="secret",
+        MICROSOFT_OAUTH_TENANT_ID="common",
+        EXEC_OUTLOOK_CREDENTIALS_PATH=str(credentials_path),
+    )
+
+
+def _write_exec_outlook_credential(settings: Settings, *, email: str = "exec@acme.io") -> None:
+    path = Path(str(settings.exec_outlook_credentials_path))
+    path.write_text(json.dumps({
+        "version": 1, "email": email,
+        "authorized_user": {
+            "refresh_token": "r", "client_id": "cid", "client_secret": "secret", "tenant_id": "common",
+        },
+    }))
+
+
+async def test_outlook_connected(outlook_settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_exec_outlook_credential(outlook_settings)
+
+    async def fake_profile_email(self: Any) -> str:
+        return "exec@acme.io"
+
+    monkeypatch.setattr(
+        "openexecutive.integrations.outlook_client.OutlookClient.profile_email", fake_profile_email
+    )
+    fresh = await check_outlook(make_snap(outlook_settings))
+    assert fresh.state == "ok"
+    assert "exec@acme.io's Outlook inbox" in fresh.summary and "No Outlook mail has come in yet" in fresh.summary
+
+    seen = await check_outlook(
+        make_snap(outlook_settings, last_inbound={"outlook": inbound("outlook", "Inbound email")})
+    )
+    assert "No Outlook mail has come in yet" not in seen.summary
+    assert seen.last_activity is not None
+    assert_no_secret(seen, "secret")
+
+
+async def test_outlook_problems(outlook_settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert (await check_outlook(make_snap())).state == "off"
+
+    no_credential = await check_outlook(make_snap(outlook_settings))
+    assert no_credential.state == "error" and "no credential file" in no_credential.summary
+
+    _write_exec_outlook_credential(outlook_settings)
+
+    async def fake_profile_email(self: Any) -> str:
+        # The credential nominally claims exec@acme.io, but Graph reports a
+        # different mailbox for it (e.g. the account was renamed).
+        return "someone.else@acme.io"
+
+    monkeypatch.setattr(
+        "openexecutive.integrations.outlook_client.OutlookClient.profile_email", fake_profile_email
+    )
+    mismatched = await check_outlook(make_snap(outlook_settings))
+    assert mismatched.state == "error" and "isn't the Executive's own address" in mismatched.summary
 
 
 # ---------------------------------------------------------------------------

@@ -24,7 +24,7 @@ from openexecutive.workflows import resumer
 
 def _load_facts() -> dict[str, Any]:
     path = Path(facts_mod.__file__).parent / "architecture-facts.yaml"
-    return yaml.safe_load(path.read_text())
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
 def _resumer_source() -> str:

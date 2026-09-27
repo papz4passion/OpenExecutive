@@ -102,6 +102,8 @@ LABELS: dict[str, str] = {
     "api_secret": "API protection",
     "gmail": "Email (Gmail)",
     "your_gmail": "Your own Gmail (Act as me)",
+    "outlook": "Email (Outlook)",
+    "your_outlook": "Your own Outlook (Act as me)",
     "slack": "Slack",
     "discord": "Discord",
     "telegram": "Telegram",
@@ -847,6 +849,126 @@ async def check_your_gmail(snap: Snapshot) -> SetupCheck:
     return _result("your_gmail", "error" if on else "warn", STATUS_MESSAGES[status], link="/settings")
 
 
+def _microsoft_oauth_missing(settings: Settings) -> str | None:
+    if settings.microsoft_oauth_client_id and settings.microsoft_oauth_client_secret and settings.microsoft_oauth_tenant_id:
+        return None
+    return "MICROSOFT_OAUTH_CLIENT_ID, MICROSOFT_OAUTH_CLIENT_SECRET and MICROSOFT_OAUTH_TENANT_ID"
+
+
+async def check_outlook(snap: Snapshot) -> SetupCheck:
+    """The Executive's own Outlook mailbox (optional). No MCP server exists
+    for Outlook (design.md decision 1), so this probes Microsoft Graph
+    directly instead of checking a configured MCP server the way
+    check_gmail does."""
+    from openexecutive.integrations.outlook_client import (
+        GraphError,
+        load_exec_credential,
+        outlook_for,
+    )
+
+    settings = snap.settings
+    missing = _microsoft_oauth_missing(settings)
+    if missing or not settings.exec_outlook_credentials_path:
+        return _result(
+            "outlook",
+            "off",
+            "Not set up (optional): the Executive can't read or send Outlook mail.",
+            "To connect Outlook, follow docs/outlook_setup.md.",
+        )
+    if load_exec_credential() is None:
+        return _result(
+            "outlook",
+            "error",
+            "Microsoft OAuth is configured but no credential file was found (or it's unreadable).",
+            f"Run scripts/connect-own-outlook.py as {settings.exec_email_address}, then put the file it "
+            f"writes at EXEC_OUTLOOK_CREDENTIALS_PATH, {_RESTART}",
+        )
+    try:
+        opened = await asyncio.wait_for(
+            outlook_for(settings.exec_email_address).profile_email(), PROBE_TIMEOUT_S
+        )
+    except TimeoutError:
+        return _result(
+            "outlook",
+            "warn",
+            f"Microsoft didn't answer within {PROBE_TIMEOUT_S:.0f} seconds.",
+            "Check again in a moment.",
+        )
+    except GraphError:
+        return _result(
+            "outlook",
+            "error",
+            "Microsoft refused the saved sign-in for the Executive's Outlook mailbox.",
+            f"Run scripts/connect-own-outlook.py as {settings.exec_email_address} again, {_RESTART}",
+        )
+    if opened.lower() != settings.exec_email_address.lower():
+        return _result(
+            "outlook",
+            "error",
+            f"The connected Outlook mailbox ({opened}) isn't the Executive's own address.",
+            f"Run scripts/connect-own-outlook.py signed in as {settings.exec_email_address}, {_RESTART}",
+        )
+    summary = (
+        f"Connected. The Executive checks {settings.exec_email_address}'s Outlook inbox every "
+        f"{settings.email_poll_interval_seconds} seconds."
+    )
+    if snap.last_inbound.get("outlook") is None:
+        summary += " No Outlook mail has come in yet."
+    return _channel_ready(snap, "outlook", summary, actor="outlook", roster=None)
+
+
+async def check_your_outlook(snap: Snapshot) -> SetupCheck:
+    """The owner's own Outlook, for Act as me (optional). Mirrors
+    check_your_gmail — a person connects at most one provider, so this and
+    "your_gmail" report independently; whichever they actually connected
+    shows "ok", the other "off"."""
+    from openexecutive.delegation.outlook import STATUS_MESSAGES as OUTLOOK_STATUS_MESSAGES
+    from openexecutive.delegation.outlook import outlook_status
+    from openexecutive.delegation.settings import is_enabled
+
+    owner = snap.principal
+    if owner is None or not owner.email:
+        return _result(
+            "your_outlook",
+            "off",
+            "Not set up (optional): Act as me needs an owner with an email on the team list.",
+        )
+    on = await asyncio.to_thread(is_enabled, owner.id)
+    try:
+        status = await asyncio.wait_for(outlook_status(owner.email), PROBE_TIMEOUT_S)
+    except TimeoutError:
+        return _result(
+            "your_outlook",
+            "warn",
+            f"Microsoft didn't answer within {PROBE_TIMEOUT_S:.0f} seconds.",
+            "Click Check again in a moment.",
+            link="/settings",
+        )
+    if status == "connected":
+        summary = f"Connected to {owner.email}. " + (
+            "Act as me is on: the Executive can draft replies as you, in your own Outlook."
+            if on
+            else "Turn Act as me on in Settings to let the Executive draft replies as you."
+        )
+        return _result("your_outlook", "ok", summary, link="/settings")
+    if status == "not_configured":
+        return _result(
+            "your_outlook",
+            "warn" if on else "off",
+            "Not set up (optional): the Executive can't draft emails as you in your own Outlook.",
+            "Signed in as yourself, run scripts/connect-own-outlook.py (see docs/outlook_setup.md), "
+            "then put the file it writes in DELEGATION_OUTLOOK_CREDENTIALS_DIR.",
+            link="/settings",
+        )
+    if status == "shared_mailbox" and not on:
+        # Not a fault while it's off: the owner simply uses the Executive's
+        # own address, and Act as me can't be turned on that way.
+        return _result(
+            "your_outlook", "off", "Not set up (optional): " + OUTLOOK_STATUS_MESSAGES[status], link="/settings"
+        )
+    return _result("your_outlook", "error" if on else "warn", OUTLOOK_STATUS_MESSAGES[status], link="/settings")
+
+
 # ---------------------------------------------------------------------------
 # What runs in the background
 # ---------------------------------------------------------------------------
@@ -1023,7 +1145,7 @@ async def check_memory(snap: Snapshot) -> SetupCheck:
 # Running them all
 # ---------------------------------------------------------------------------
 
-_INBOUND_ACTORS = ("slack", "discord", "telegram", "google_chat", "email")
+_INBOUND_ACTORS = ("slack", "discord", "telegram", "google_chat", "email", "outlook")
 
 
 def _latest_inbound() -> dict[str, AuditEvent | None]:
@@ -1082,6 +1204,8 @@ def _check_runners(
         "api_secret": off_loop(check_api_protection),
         "gmail": off_loop(check_gmail),
         "your_gmail": lambda: check_your_gmail(snap),
+        "outlook": lambda: check_outlook(snap),
+        "your_outlook": lambda: check_your_outlook(snap),
         "slack": lambda: check_slack(snap, http),
         "discord": lambda: check_discord(snap, http),
         "telegram": lambda: check_telegram(snap, http),

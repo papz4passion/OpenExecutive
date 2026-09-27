@@ -83,6 +83,10 @@ from openexecutive.orchestrator.open_loop_tools import (
     OPEN_LOOP_TOOL_HANDLERS,
     OPEN_LOOP_TOOLS,
 )
+from openexecutive.orchestrator.outlook_tools import (
+    OUTLOOK_TOOL_HANDLERS,
+    OUTLOOK_TOOLS,
+)
 from openexecutive.orchestrator.people_tools import (
     PEOPLE_TOOL_HANDLERS,
     PEOPLE_TOOLS,
@@ -391,6 +395,7 @@ _ALL_SKILL_TOOLS = [
     *WORKFLOW_AUTHORING_TOOLS,
     *WORKFLOW_RUN_TOOLS,
     *FORM_TOOLS,
+    *OUTLOOK_TOOLS,
 ]
 _ALL_SKILL_HANDLERS = {
     **SKILL_TOOL_HANDLERS,
@@ -409,6 +414,7 @@ _ALL_SKILL_HANDLERS = {
     **WORKFLOW_AUTHORING_TOOL_HANDLERS,
     **WORKFLOW_RUN_TOOL_HANDLERS,
     **FORM_TOOL_HANDLERS,
+    **OUTLOOK_TOOL_HANDLERS,
 }
 
 

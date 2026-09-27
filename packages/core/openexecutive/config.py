@@ -405,6 +405,10 @@ class Settings(BaseSettings):
             self.company_profile_path = base / self.company_profile_path
         if not self.delegation_google_credentials_dir.is_absolute():
             self.delegation_google_credentials_dir = base / self.delegation_google_credentials_dir
+        if not self.delegation_outlook_credentials_dir.is_absolute():
+            self.delegation_outlook_credentials_dir = base / self.delegation_outlook_credentials_dir
+        if self.exec_outlook_credentials_path is not None and not self.exec_outlook_credentials_path.is_absolute():
+            self.exec_outlook_credentials_path = base / self.exec_outlook_credentials_path
         return self
 
     slack_bot_token: str | None = Field(None, alias="SLACK_BOT_TOKEN")
@@ -819,6 +823,31 @@ class Settings(BaseSettings):
     # (orchestrator.delegation_tools.DAILY_COUNT_ROWS).
     delegation_max_drafts_per_day: int = Field(
         50, alias="DELEGATION_MAX_DRAFTS_PER_DAY", ge=1, le=1000
+    )
+
+    # ---- Outlook / Microsoft Graph (integrations/, delegation/outlook.py) ----
+    # Azure AD app registration. All optional — absence disables the
+    # Executive's own Outlook mailbox and Outlook "Act as me" everywhere,
+    # exactly like every other optional integration in this file.
+    microsoft_oauth_client_id: str | None = Field(None, alias="MICROSOFT_OAUTH_CLIENT_ID")
+    microsoft_oauth_client_secret: str | None = Field(
+        None, alias="MICROSOFT_OAUTH_CLIENT_SECRET"
+    )
+    # "common" for multi-tenant, or a specific tenant GUID/domain.
+    microsoft_oauth_tenant_id: str | None = Field(None, alias="MICROSOFT_OAUTH_TENANT_ID")
+    # Where each person's own-Outlook credential lives, one file per person
+    # (written by scripts/connect-own-outlook.py). Never shared with the
+    # Executive's own Outlook credential path below, mirroring the Gmail
+    # delegation_google_credentials_dir / exec-own-mailbox split.
+    delegation_outlook_credentials_dir: Path = Field(
+        _ROOT / "company" / "delegation_outlook", alias="DELEGATION_OUTLOOK_CREDENTIALS_DIR"
+    )
+    # Credential file for the Executive's OWN Outlook mailbox (own-inbox
+    # poller + native send/reply/draft tools). Distinct from the delegation
+    # dir above: this one is never reachable from the general tool surface
+    # the way a delegated mailbox is scoped to fixed handlers only.
+    exec_outlook_credentials_path: Path | None = Field(
+        None, alias="EXEC_OUTLOOK_CREDENTIALS_PATH"
     )
 
     # External-condition monitoring — heartbeat that polls source adapters

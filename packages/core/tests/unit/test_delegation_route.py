@@ -55,13 +55,13 @@ def ids() -> dict[str, int]:
 
 @pytest.fixture
 def gmail(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
-    """The Gmail status every route sees (no network)."""
+    """The mailbox status every route sees (no network)."""
     state = {"status": "not_configured"}
 
-    async def fake(email: str | None, *, gmail: Any = None) -> str:
+    async def fake(email: str | None, *, mailbox: Any = None) -> str:
         return state["status"]
 
-    monkeypatch.setattr(route, "gmail_status", fake)
+    monkeypatch.setattr(route, "mailbox_status", fake)
     return state
 
 
@@ -221,7 +221,7 @@ class _Mailbox:
 @pytest.fixture
 def mailbox(monkeypatch: pytest.MonkeyPatch) -> _Mailbox:
     box = _Mailbox("Olivia Owner\nFernway Studio")
-    monkeypatch.setattr(route, "gmail_for", lambda email: box)
+    monkeypatch.setattr(route, "mailbox_for", lambda email: box)
     return box
 
 

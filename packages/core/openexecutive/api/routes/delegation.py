@@ -40,13 +40,11 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from openexecutive.delegation.gmail import (
-    STATUS_MESSAGES,
-    GmailAuthError,
-    GmailError,
-    gmail_for,
-    gmail_status,
-)
+from openexecutive.delegation.gmail import STATUS_MESSAGES as GMAIL_STATUS_MESSAGES
+from openexecutive.delegation.gmail import GmailAuthError, GmailError, gmail_for
+from openexecutive.delegation.mailbox import mailbox_for, mailbox_status
+from openexecutive.delegation.outlook import STATUS_MESSAGES as OUTLOOK_STATUS_MESSAGES
+from openexecutive.delegation.outlook import DelegateOutlook
 from openexecutive.delegation.settings import can_delegate, is_enabled, local_login, set_enabled
 from openexecutive.delegation.voice import (
     StoredVoice,
@@ -57,27 +55,57 @@ from openexecutive.delegation.voice import (
     save_voice,
     validate_profile,
 )
+from openexecutive.integrations.outlook_client import GraphAuthError, GraphError
 from openexecutive.people.models import Person
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# Gmail status -> the 409 code a caller gets when it blocks turning it on.
-_BLOCKING_CODES: dict[str, str] = {
-    "not_configured": "gmail_not_connected",
-    "needs_reconnect": "gmail_needs_reconnect",
-    "mismatch": "gmail_mismatch",
+# Mailbox status -> the 409 code a caller gets when it blocks turning it on,
+# prefixed with whichever provider they've connected (or "gmail" — Gmail's
+# own prior codes, unchanged — when neither is, so an unconnected caller
+# still gets exactly the message they always did).
+_BLOCKING_CODE_SUFFIXES: dict[str, str] = {
+    "not_configured": "not_connected",
+    "needs_reconnect": "needs_reconnect",
+    "mismatch": "mismatch",
     "no_email": "no_email",
     "shared_mailbox": "shared_mailbox",
-    "error": "gmail_error",
+    "error": "error",
 }
+
+
+def _is_outlook_mailbox(mailbox: object) -> bool:
+    return isinstance(mailbox, DelegateOutlook)
+
+
+def _provider_for(person: Person) -> str:
+    return "outlook" if _is_outlook_mailbox(mailbox_for(person.email or "")) else "gmail"
+
+
+def _status_messages(provider: str) -> dict[str, str]:
+    return OUTLOOK_STATUS_MESSAGES if provider == "outlook" else GMAIL_STATUS_MESSAGES
+
+
+_UNPREFIXED_CODES = frozenset({"no_email", "shared_mailbox"})
+
+
+def _blocking_code(provider: str, status: str) -> str:
+    suffix = _BLOCKING_CODE_SUFFIXES.get(status, "error")
+    return suffix if suffix in _UNPREFIXED_CODES else f"{provider}_{suffix}"
 
 
 class GmailConnection(BaseModel):
     status: str
     message: str
     email: str | None = None
-    # The command that connects this caller's own Gmail (upstream has no
+    # Which mailbox provider this connection is (or would be): "gmail" or
+    # "outlook", decided by which credential file exists for this person
+    # (delegation.mailbox.mailbox_for). Field name kept as "gmail" — not
+    # renamed to something provider-neutral — so the existing Settings UI
+    # and any other caller reading this shape is unaffected.
+    provider: str = "gmail"
+    # The command that connects this caller's own mailbox (upstream has no
     # OAuth callback: the token is minted locally, like the Executive's own).
     connect_command: str
 
@@ -165,8 +193,10 @@ def _person_id(person: Person) -> int:
     return person.id
 
 
-def _connect_command(email: str | None) -> str:
+def _connect_command(provider: str, email: str | None) -> str:
     target = email or "you@example.com"
+    if provider == "outlook":
+        return f"uv run python scripts/connect-own-outlook.py --email {target}"
     return (
         "uv run --with google-auth-oauthlib python scripts/connect-own-gmail.py "
         f"--email {target}"
@@ -174,14 +204,16 @@ def _connect_command(email: str | None) -> str:
 
 
 async def _state(person: Person) -> DelegationOut:
-    status = await gmail_status(person.email)
+    provider = _provider_for(person)
+    status = await mailbox_status(person.email)
     return DelegationOut(
         enabled=is_enabled(person.id),
         gmail=GmailConnection(
             status=status,
-            message=STATUS_MESSAGES[status],
+            message=_status_messages(provider)[status],
             email=person.email,
-            connect_command=_connect_command(person.email),
+            provider=provider,
+            connect_command=_connect_command(provider, person.email),
         ),
     )
 
@@ -220,9 +252,10 @@ async def update_delegation(request: Request, body: DelegationUpdate) -> Delegat
     person = _caller(request)
     person_id = _person_id(person)
     if body.enabled:
-        status = await gmail_status(person.email)
+        provider = _provider_for(person)
+        status = await mailbox_status(person.email)
         if status != "connected":
-            raise _refuse(409, _BLOCKING_CODES.get(status, "gmail_error"), STATUS_MESSAGES[status])
+            raise _refuse(409, _blocking_code(provider, status), _status_messages(provider)[status])
     before = is_enabled(person_id)
     if before != body.enabled:
         set_enabled(person_id, body.enabled, updated_by=f"person:{person_id}")
@@ -249,38 +282,49 @@ def get_delegation_voice(request: Request) -> VoiceOut:
 @router.post("/delegation/voice/learn", response_model=VoiceOut)
 async def learn_delegation_voice(request: Request) -> VoiceOut:
     person = _caller(request)
-    status = await gmail_status(person.email)
+    provider = _provider_for(person)
+    # mailbox_for returns None when neither provider is connected; fall back
+    # to a Gmail client anyway (never returns None) so a "connected" status
+    # from a caller-injected mailbox_status still has a client to use.
+    mailbox = mailbox_for(person.email or "") or gmail_for(person.email or "")
+    status = await mailbox_status(person.email, mailbox=mailbox)
     if status != "connected":
-        raise _refuse(409, _BLOCKING_CODES.get(status, "gmail_error"), STATUS_MESSAGES[status])
+        raise _refuse(409, _blocking_code(provider, status), _status_messages(provider)[status])
     try:
-        stored = await learn_from_sent_mail(person, gmail_for(person.email or ""))
+        stored = await learn_from_sent_mail(person, mailbox)
     except VoiceError as exc:
         raise _refuse(409, exc.code, exc.message) from exc
-    except GmailAuthError as exc:
-        raise _refuse(409, "gmail_needs_reconnect", STATUS_MESSAGES["needs_reconnect"]) from exc
-    except GmailError as exc:
+    except (GmailAuthError, GraphAuthError) as exc:
+        raise _refuse(
+            409, _blocking_code(provider, "needs_reconnect"), _status_messages(provider)["needs_reconnect"]
+        ) from exc
+    except (GmailError, GraphError) as exc:
         logger.warning("delegation: learning the voice failed", exc_info=True)
-        raise _refuse(502, "gmail_error", STATUS_MESSAGES["error"]) from exc
+        raise _refuse(502, _blocking_code(provider, "error"), _status_messages(provider)["error"]) from exc
     return _voice_out(stored)
 
 
 @router.post("/delegation/voice/signature", response_model=VoiceOut)
 async def refresh_delegation_signature(request: Request) -> VoiceOut:
-    """Read the signature from the caller's Gmail settings again and keep
+    """Read the signature from the caller's mailbox settings again and keep
     everything else, lock included: a relearn would replace their edits."""
     person = _caller(request)
     person_id = _person_id(person)
-    status = await gmail_status(person.email)
+    provider = _provider_for(person)
+    mailbox = mailbox_for(person.email or "") or gmail_for(person.email or "")
+    status = await mailbox_status(person.email, mailbox=mailbox)
     if status != "connected":
-        raise _refuse(409, _BLOCKING_CODES.get(status, "gmail_error"), STATUS_MESSAGES[status])
+        raise _refuse(409, _blocking_code(provider, status), _status_messages(provider)[status])
     try:
-        signature = await gmail_for(person.email or "").send_as_signature()
-    except GmailAuthError as exc:
-        raise _refuse(409, "gmail_needs_reconnect", STATUS_MESSAGES["needs_reconnect"]) from exc
-    except GmailError as exc:
-        logger.warning("delegation: reading the Gmail signature failed", exc_info=True)
-        raise _refuse(502, "gmail_error", STATUS_MESSAGES["error"]) from exc
-    # Read after the Gmail call, so an edit made meanwhile is kept.
+        signature = await mailbox.send_as_signature()
+    except (GmailAuthError, GraphAuthError) as exc:
+        raise _refuse(
+            409, _blocking_code(provider, "needs_reconnect"), _status_messages(provider)["needs_reconnect"]
+        ) from exc
+    except (GmailError, GraphError) as exc:
+        logger.warning("delegation: reading the mailbox signature failed", exc_info=True)
+        raise _refuse(502, _blocking_code(provider, "error"), _status_messages(provider)["error"]) from exc
+    # Read after the mailbox call, so an edit made meanwhile is kept.
     stored = get_voice(person_id)
     profile, _ = validate_profile(
         {**asdict(stored.profile), "signature": signature}, allow_exemplars=True, keep_signature=True
@@ -288,7 +332,7 @@ async def refresh_delegation_signature(request: Request) -> VoiceOut:
     saved = save_voice(person_id, profile, locked=stored.locked, updated_by=f"person:{person_id}")
     _audit(
         "delegation_voice_changed",
-        f"Signature taken from Gmail settings by person {person_id}",
+        f"Signature taken from {provider} settings by person {person_id}",
         {"op": "signature", "person_id": person_id, "has_signature": bool(profile.signature)},
     )
     return _voice_out(saved)
